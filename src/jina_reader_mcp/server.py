@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import os
 from dataclasses import dataclass
 from typing import Annotated, Literal
@@ -13,6 +14,7 @@ from pydantic import Field
 
 
 Engine = Literal["auto", "curl", "browser"]
+MAX_BATCH_SIZE = 2
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -164,6 +166,29 @@ async def read_url(
 ) -> str:
     """Fetch one public URL and return clean Markdown."""
     return await _fetch(url, engine, max_tokens, timeout, target_selector, wait_for_selector)
+
+
+@mcp.tool()
+async def read_urls(
+    urls: Annotated[list[str], Field(description="One or two absolute public http(s) URLs to read.", min_length=1, max_length=MAX_BATCH_SIZE)],
+    engine: Annotated[Engine, Field(description="Reader engine: auto, curl, or browser.")] = "auto",
+    max_tokens: Annotated[int, Field(description="Maximum output size per URL in Reader tokens.", ge=500, le=50000)] = settings.max_tokens,
+    timeout: Annotated[int, Field(description="Maximum fetch time per URL in seconds.", ge=1, le=180)] = settings.timeout_seconds,
+    target_selector: Annotated[str | None, Field(description="Optional CSS selector for the main content on every URL.")] = None,
+    wait_for_selector: Annotated[str | None, Field(description="Optional CSS selector to wait for on every URL.")] = None,
+) -> str:
+    """Fetch up to two public URLs and return a JSON result for each URL."""
+    results = await asyncio.gather(
+        *(_fetch(url, engine, max_tokens, timeout, target_selector, wait_for_selector) for url in urls),
+        return_exceptions=True,
+    )
+    payload = []
+    for url, result in zip(urls, results):
+        if isinstance(result, Exception):
+            payload.append({"url": url, "error": str(result)})
+        else:
+            payload.append({"url": url, "content": result})
+    return json.dumps({"results": payload}, ensure_ascii=False)
 
 
 def main() -> None:

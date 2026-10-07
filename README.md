@@ -10,7 +10,7 @@ The Reader service does the browser work and Markdown extraction. This project o
 Agent --stdio MCP--> jina-reader-mcp --HTTP--> Jina Reader OSS
 ```
 
-The adapter defaults to `http://127.0.0.1:3000`, uses one in-flight fetch, limits the output to 8,000 Reader tokens, and rejects obvious local or private targets.
+The adapter defaults to `http://127.0.0.1:3000`, uses one in-flight fetch, limits each URL to 8,000 Reader tokens, and rejects obvious local or private targets. It exposes `read_url` for one page and `read_urls` for a bounded batch of up to two pages.
 
 ## Run the Reader backend
 
@@ -42,7 +42,23 @@ uv sync
 uv run jina-reader-mcp
 ```
 
-The MCP server uses stdio, so configure your Agent to launch `jina-reader-mcp` from this checkout. The tool is named `read_url`.
+The MCP server uses stdio, so configure your Agent to launch `jina-reader-mcp` from this checkout. The tools are named `read_url` and `read_urls`.
+
+Example stdio configuration:
+
+```json
+{
+  "mcpServers": {
+    "local-jina-reader": {
+      "command": "uv",
+      "args": ["run", "--directory", "D:/path/to/jina-reader-mcp-local", "jina-reader-mcp"],
+      "env": {
+        "READER_BASE_URL": "http://127.0.0.1:3000"
+      }
+    }
+  }
+}
+```
 
 ## Configuration
 
@@ -54,7 +70,9 @@ The MCP server uses stdio, so configure your Agent to launch `jina-reader-mcp` f
 | `READER_MAX_TOKENS` | `8000` | Default Reader output cap, 500-50000 |
 | `READER_MAX_CONCURRENCY` | `1` | Maximum concurrent fetches, 1-4 |
 
-The first version intentionally exposes only `read_url`. Search, parallel fetches, caching, and arbitrary cookies or headers can be added after the single-page path is verified.
+`read_urls` returns a JSON object with one result per input URL. A failed URL is reported as an `error` entry without discarding successful results from the same batch. The batch is capped at two URLs and still passes through the adapter's global concurrency limit.
+
+Search is intentionally not exposed yet: the self-hosted Reader search process needs a populated local index or an external Google/Bing SERP provider, neither of which is available in the default stateless setup. The adapter also does not pretend that `X-Max-Tokens` is resumable pagination; add a continuation protocol only if a Reader response contract provides a real cursor.
 
 ## Development
 

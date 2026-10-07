@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -48,6 +49,18 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result, "# Example")
         fake_client.post.assert_awaited_once()
+
+    async def test_read_urls_keeps_per_url_results(self) -> None:
+        async def fake_fetch(url, *_args):
+            if url.endswith("/bad"):
+                raise RuntimeError("Reader unavailable")
+            return "# Good"
+
+        with patch("jina_reader_mcp.server._fetch", new=AsyncMock(side_effect=fake_fetch)):
+            result = json.loads(await server.read_urls(["https://example.com/good", "https://example.com/bad"]))
+
+        self.assertEqual(result["results"][0], {"url": "https://example.com/good", "content": "# Good"})
+        self.assertEqual(result["results"][1], {"url": "https://example.com/bad", "error": "Reader unavailable"})
 
 
 if __name__ == "__main__":
