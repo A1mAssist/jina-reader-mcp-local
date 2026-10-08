@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from dataclasses import replace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -44,7 +45,9 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
             async def __aexit__(self, *_):
                 return None
 
-        with patch("jina_reader_mcp.server.httpx.AsyncClient", return_value=ClientContext()):
+        with patch.object(server, "settings", replace(server.settings, backend="reader")), patch(
+            "jina_reader_mcp.server.httpx.AsyncClient", return_value=ClientContext()
+        ):
             result = await server._fetch("https://example.com", "auto", 8000, 30, None, None)
 
         self.assertEqual(result, "# Example")
@@ -61,6 +64,32 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["results"][0], {"url": "https://example.com/good", "content": "# Good"})
         self.assertEqual(result["results"][1], {"url": "https://example.com/bad", "error": "Reader unavailable"})
+
+    async def test_search_web_returns_links(self) -> None:
+        with patch("jina_reader_mcp.server.getproxies", return_value={"https": "http://127.0.0.1:7890"}), patch(
+            "jina_reader_mcp.server.DDGS"
+        ) as ddgs:
+            ddgs.return_value.text.return_value = [
+                {"title": "Example", "href": "https://example.com", "body": "Example result"}
+            ]
+            result = json.loads(await server.search_web("example", count=1))
+
+        self.assertEqual(result["results"][0]["url"], "https://example.com")
+        self.assertEqual(ddgs.return_value.text.call_args.kwargs["backend"], "auto")
+        self.assertEqual(ddgs.call_args.kwargs["proxy"], "http://127.0.0.1:7890")
+
+    async def test_native_reader_rejects_redirect_to_localhost(self) -> None:
+        def redirect(request):
+            return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
+
+        client_type = httpx.AsyncClient
+        transport = httpx.MockTransport(redirect)
+        with patch("jina_reader_mcp.server.getproxies", return_value={}), patch(
+            "jina_reader_mcp.server.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_type(transport=transport, **kwargs),
+        ):
+            with self.assertRaises(ValueError):
+                await server._native_fetch("https://example.com", "auto", 8000, 30, None, None)
 
 
 if __name__ == "__main__":

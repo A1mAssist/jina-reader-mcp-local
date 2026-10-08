@@ -5,16 +5,23 @@ import ipaddress
 import json
 import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
+from urllib.request import getproxies
 
 import httpx
+import trafilatura
+from ddgs import DDGS
 from mcp.server.fastmcp import FastMCP
+from playwright.async_api import async_playwright
 from pydantic import Field
 
 
 Engine = Literal["auto", "curl", "browser"]
+SearchEngine = Literal["auto", "google"]
 MAX_BATCH_SIZE = 2
+MAX_HTML_BYTES = 5_000_000
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -32,11 +39,13 @@ def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
 
 @dataclass(frozen=True)
 class Settings:
+    backend: str
     reader_base_url: str
     api_key: str
     timeout_seconds: int
     max_tokens: int
     max_concurrency: int
+    chrome_path: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -44,23 +53,27 @@ class Settings:
         parsed = urlparse(base_url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise RuntimeError("READER_BASE_URL must be an http(s) URL")
+        backend = os.getenv("READER_BACKEND", "native").strip().lower()
+        if backend not in {"native", "reader"}:
+            raise RuntimeError("READER_BACKEND must be native or reader")
         return cls(
+            backend=backend,
             reader_base_url=base_url,
             api_key=os.getenv("READER_API_KEY", "").strip(),
             timeout_seconds=_env_int("READER_TIMEOUT_SECONDS", 30, 1, 180),
             max_tokens=_env_int("READER_MAX_TOKENS", 8000, 500, 50000),
             max_concurrency=_env_int("READER_MAX_CONCURRENCY", 1, 1, 4),
+            chrome_path=os.getenv("CHROME_PATH", r"C:\Program Files\Google\Chrome\Application\chrome.exe"),
         )
 
 
 settings = Settings.from_env()
 semaphore = asyncio.Semaphore(settings.max_concurrency)
 mcp = FastMCP(
-    "local-jina-reader",
+    "local-web-reader",
     instructions=(
-        "Read public web pages through the local Jina Reader service. "
-        "Use read_url only when web content is needed; prefer a target_selector "
-        "for pages with a known content container."
+        "Search the web and read public pages from this computer. "
+        "Use search_web for discovery and read_url for page content."
     ),
 )
 
@@ -128,21 +141,23 @@ async def _fetch(
     if not 1 <= timeout <= 180:
         raise ValueError("timeout must be between 1 and 180 seconds")
 
-    request_headers = _headers(engine, max_tokens, target_selector, wait_for_selector)
     async with semaphore:
-        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-            try:
+        try:
+            if settings.backend == "native":
+                return await _native_fetch(url, engine, max_tokens, timeout, target_selector, wait_for_selector)
+            request_headers = _headers(engine, max_tokens, target_selector, wait_for_selector)
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
                 response = await client.post(
                     f"{settings.reader_base_url}/",
                     headers=request_headers,
                     json={"url": url, "timeout": timeout},
                 )
                 response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                detail = exc.response.text[:500].replace("\n", " ")
-                raise RuntimeError(f"Reader returned HTTP {exc.response.status_code}: {detail}") from exc
-            except httpx.HTTPError as exc:
-                raise RuntimeError(f"Reader request failed: {exc}") from exc
+        except httpx.HTTPStatusError as exc:
+            detail = exc.response.text[:500].replace("\n", " ")
+            raise RuntimeError(f"Web server returned HTTP {exc.response.status_code}: {detail}") from exc
+        except httpx.HTTPError as exc:
+            raise RuntimeError(f"Web request failed: {exc}") from exc
 
     content_type = response.headers.get("content-type", "")
     if "application/json" in content_type:
@@ -153,6 +168,106 @@ async def _fetch(
                 return data["content"]
         return str(payload)
     return response.text
+
+
+async def _native_fetch(
+    url: str, engine: Engine, max_tokens: int, timeout: int,
+    target_selector: str | None, wait_for_selector: str | None,
+) -> str:
+    if engine == "browser" or target_selector or wait_for_selector:
+        chrome = Path(settings.chrome_path)
+        if not chrome.is_file():
+            raise RuntimeError(f"Chrome executable not found: {chrome}. Set CHROME_PATH.")
+        async with async_playwright() as playwright:
+            browser = await playwright.chromium.launch(
+                executable_path=str(chrome), headless=True,
+                proxy={"server": getproxies()["https"]} if getproxies().get("https") else None,
+            )
+            try:
+                page = await browser.new_page()
+                async def allow_public(route):
+                    try:
+                        validate_target_url(route.request.url)
+                    except ValueError:
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                await page.route("**/*", allow_public)
+                response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
+                if response and response.status >= 400:
+                    raise RuntimeError(f"Web server returned HTTP {response.status}")
+                validate_target_url(page.url)
+                if wait_for_selector:
+                    await page.locator(wait_for_selector).wait_for(timeout=timeout * 1000)
+                html = await (page.locator(target_selector).first.inner_html() if target_selector else page.content())
+                if len(html.encode("utf-8")) > MAX_HTML_BYTES:
+                    raise RuntimeError("HTML page exceeds 5 MB limit")
+                final_url = page.url
+            finally:
+                await browser.close()
+    else:
+        proxy = getproxies().get("https") or getproxies().get("http")
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, proxy=proxy) as client:
+            for _ in range(6):
+                async with client.stream("GET", url, headers={"Accept": "text/html,application/xhtml+xml"}) as response:
+                    if response.is_redirect:
+                        url = str(response.next_request.url)
+                        validate_target_url(url)
+                        continue
+                    response.raise_for_status()
+                    if "html" not in response.headers.get("content-type", "").lower():
+                        raise RuntimeError("Native reader supports HTML pages only")
+                    chunks = bytearray()
+                    async for chunk in response.aiter_bytes():
+                        chunks.extend(chunk)
+                        if len(chunks) > MAX_HTML_BYTES:
+                            raise RuntimeError("HTML page exceeds 5 MB limit")
+                    html = chunks.decode(response.encoding or "utf-8", errors="replace")
+                    final_url = url
+                    break
+            else:
+                raise RuntimeError("Too many redirects")
+
+    content = await asyncio.to_thread(
+        trafilatura.extract, html, url=final_url, output_format="markdown", include_links=True,
+    )
+    if not content:
+        raise RuntimeError("No readable content found; try engine='browser'")
+    return content[:max_tokens * 4]
+
+
+@mcp.tool()
+async def search_web(
+    query: Annotated[str, Field(description="Web search query, 1-300 characters.", min_length=1, max_length=300)],
+    count: Annotated[int, Field(description="Maximum results.", ge=1, le=10)] = 5,
+    engine: Annotated[SearchEngine, Field(description="Automatic multi-engine search or Google only.")] = "auto",
+) -> str:
+    """Search from this computer and return titles, links and snippets."""
+    if not query.strip() or len(query) > 300:
+        raise ValueError("query must contain 1-300 characters")
+    if not 1 <= count <= 10:
+        raise ValueError("count must be between 1 and 10")
+    if engine not in {"auto", "google"}:
+        raise ValueError("engine must be auto or google")
+
+    def run_search() -> list[dict[str, str]]:
+        proxy = getproxies().get("https") or getproxies().get("http")
+        results = DDGS(proxy=proxy, timeout=settings.timeout_seconds).text(
+            query, max_results=count, backend=engine,
+        )
+        return [
+            {"title": item.get("title", ""), "url": item.get("href", ""), "snippet": item.get("body", "")}
+            for item in results[:count]
+        ]
+
+    async with semaphore:
+        try:
+            results = await asyncio.to_thread(run_search)
+        except Exception as exc:
+            raise RuntimeError(f"{engine} search failed: {exc}") from exc
+    if not results:
+        raise RuntimeError(f"{engine} returned no results")
+    return json.dumps({"results": results}, ensure_ascii=False)
 
 
 @mcp.tool()
