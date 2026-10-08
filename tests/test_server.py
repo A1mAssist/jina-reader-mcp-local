@@ -4,14 +4,40 @@ import socket
 import threading
 import unittest
 from dataclasses import replace
+from io import BytesIO
 from unittest.mock import AsyncMock, patch
 
 import httpx
+from pypdf import PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from jina_reader_mcp import server
 
 
+def sample_pdf() -> bytes:
+    writer = PdfWriter()
+    page = writer.add_blank_page(width=200, height=200)
+    font = DictionaryObject({
+        NameObject("/Type"): NameObject("/Font"),
+        NameObject("/Subtype"): NameObject("/Type1"),
+        NameObject("/BaseFont"): NameObject("/Helvetica"),
+    })
+    page[NameObject("/Resources")] = DictionaryObject({
+        NameObject("/Font"): DictionaryObject({NameObject("/F1"): writer._add_object(font)}),
+    })
+    stream = DecodedStreamObject()
+    stream.set_data(b"BT /F1 12 Tf 10 100 Td (Hello PDF) Tj ET")
+    page[NameObject("/Contents")] = writer._add_object(stream)
+    output = BytesIO()
+    writer.write(output)
+    return output.getvalue()
+
+
 class ValidationTests(unittest.TestCase):
+    def test_proxy_falls_back_to_all_proxy(self) -> None:
+        with patch("jina_reader_mcp.server.getproxies", return_value={"all": "http://127.0.0.1:7890"}):
+            self.assertEqual(server.configured_proxy(), "http://127.0.0.1:7890")
+
     def test_accepts_public_url(self) -> None:
         self.assertEqual(server.validate_target_url("https://example.com/a"), "https://example.com/a")
 
@@ -37,6 +63,48 @@ class ValidationTests(unittest.TestCase):
 
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_cache_rechecks_navigation_and_validates_every_url(self) -> None:
+        checked_hosts = {}
+        with patch("jina_reader_mcp.server.validate_public_destination", new=AsyncMock(return_value="ok")) as validate:
+            await server.validate_browser_request("https://example.com/page", True, checked_hosts)
+            await server.validate_browser_request("https://example.com/script.js", False, checked_hosts)
+            self.assertEqual(validate.await_count, 1)
+            await server.validate_browser_request("https://example.com/next", True, checked_hosts)
+            self.assertEqual(validate.await_count, 2)
+            with self.assertRaises(ValueError):
+                await server.validate_browser_request("https://user:secret@example.com/script.js", False, checked_hosts)
+
+    async def test_reads_text_pdf_and_caps_download(self) -> None:
+        data = sample_pdf()
+        client_type = httpx.AsyncClient
+        mime = {"content-type": "application/pdf"}
+        transport = httpx.MockTransport(lambda request: httpx.Response(
+            200, content=data, headers=mime,
+        ))
+        public_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 443))]
+        with patch("jina_reader_mcp.server.socket.getaddrinfo", return_value=public_answer), patch(
+            "jina_reader_mcp.server.getproxies", return_value={}
+        ), patch(
+            "jina_reader_mcp.server.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_type(transport=transport, **kwargs),
+        ):
+            result = await server._fetch("https://example.com/document", "auto", 500, 30, None, None)
+            self.assertIn("## Page 1\n\nHello PDF", result)
+            mime["content-type"] = "application/octet-stream"
+            result = await server._fetch("https://example.com/document.pdf", "auto", 500, 30, None, None)
+            self.assertIn("Hello PDF", result)
+            with patch.object(server, "MAX_PDF_BYTES", 100):
+                with self.assertRaisesRegex(RuntimeError, "20 MB limit"):
+                    await server._fetch("https://example.com/document.pdf", "auto", 500, 30, None, None)
+
+    async def test_scan_only_pdf_has_clear_error(self) -> None:
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        output = BytesIO()
+        writer.write(output)
+        with self.assertRaisesRegex(RuntimeError, "need OCR"):
+            server.extract_pdf_text(output.getvalue())
+
     async def test_rejects_domain_with_private_dns_answer(self) -> None:
         answers = [
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 443)),

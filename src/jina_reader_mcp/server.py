@@ -6,6 +6,7 @@ import json
 import os
 import socket
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import Annotated, Literal
 from urllib.parse import urlparse
@@ -17,6 +18,8 @@ import trafilatura
 from ddgs import DDGS
 from mcp.server.fastmcp import FastMCP
 from playwright.async_api import async_playwright
+from pypdf import PdfReader
+from pypdf.errors import PdfReadError
 from pydantic import Field
 
 
@@ -24,6 +27,8 @@ Engine = Literal["auto", "curl", "browser"]
 SearchEngine = Literal["auto", "google"]
 MAX_BATCH_SIZE = 2
 MAX_HTML_BYTES = 5_000_000
+MAX_PDF_BYTES = 20_000_000
+MAX_PDF_PAGES = 100
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -80,6 +85,11 @@ mcp = FastMCP(
 )
 
 
+def configured_proxy() -> str | None:
+    proxies = getproxies()
+    return proxies.get("https") or proxies.get("http") or proxies.get("all")
+
+
 def validate_target_url(url: str) -> str:
     parsed = urlparse(url)
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
@@ -116,7 +126,7 @@ async def validate_public_destination(url: str) -> str:
         )
         addresses = [entry[4][0] for entry in answers]
     except OSError as exc:
-        proxy = getproxies().get("https") or getproxies().get("http")
+        proxy = configured_proxy()
         if not proxy:
             raise ValueError(f"Could not resolve hostname: {hostname}") from exc
         addresses = await _resolve_public_dns(hostname, proxy)
@@ -127,6 +137,17 @@ async def validate_public_destination(url: str) -> str:
         if not address.is_global or address.is_multicast:
             raise ValueError("host resolves to a non-public IP address")
     return url
+
+
+async def validate_browser_request(
+    url: str, navigation: bool, checked_hosts: dict[str, asyncio.Task[str]],
+) -> None:
+    validate_target_url(url)
+    hostname = urlparse(url).hostname
+    assert hostname is not None
+    if navigation or hostname not in checked_hosts:
+        checked_hosts[hostname] = asyncio.create_task(validate_public_destination(url))
+    await checked_hosts[hostname]
 
 
 async def _resolve_public_dns(hostname: str, proxy: str) -> list[str]:
@@ -161,6 +182,27 @@ def limit_tokens(content: str, max_tokens: int) -> str:
     if len(tokens) <= max_tokens:
         return content
     return encoding.decode_bytes(tokens[:max_tokens]).decode("utf-8", errors="ignore")
+
+
+def extract_pdf_text(data: bytes) -> str:
+    if b"%PDF-" not in data[:1024]:
+        raise RuntimeError("Response is not a PDF")
+    try:
+        reader = PdfReader(BytesIO(data))
+        if reader.is_encrypted:
+            raise RuntimeError("Password-protected PDFs are not supported")
+        if len(reader.pages) > MAX_PDF_PAGES:
+            raise RuntimeError(f"PDF exceeds {MAX_PDF_PAGES} page limit")
+        pages = [
+            f"## Page {number}\n\n{text.strip()}"
+            for number, page in enumerate(reader.pages, 1)
+            if (text := page.extract_text()) and text.strip()
+        ]
+    except PdfReadError as exc:
+        raise RuntimeError(f"Could not read PDF: {exc}") from exc
+    if not pages:
+        raise RuntimeError("PDF has no selectable text; scanned PDFs need OCR")
+    return "\n\n".join(pages)
 
 
 def _headers(
@@ -251,15 +293,20 @@ async def _native_fetch(
         if not chrome.is_file():
             raise RuntimeError(f"Chrome executable not found: {chrome}. Set CHROME_PATH.")
         async with async_playwright() as playwright:
+            proxy = configured_proxy()
             browser = await playwright.chromium.launch(
                 executable_path=str(chrome), headless=True,
-                proxy={"server": getproxies()["https"]} if getproxies().get("https") else None,
+                proxy={"server": proxy} if proxy else None,
             )
             try:
-                page = await browser.new_page()
+                context = await browser.new_context(service_workers="block")
+                page = await context.new_page()
+                checked_hosts: dict[str, asyncio.Task[str]] = {}
                 async def allow_public(route):
                     try:
-                        await validate_public_destination(route.request.url)
+                        await validate_browser_request(
+                            route.request.url, route.request.is_navigation_request(), checked_hosts,
+                        )
                     except ValueError:
                         await route.abort()
                     else:
@@ -278,7 +325,7 @@ async def _native_fetch(
             finally:
                 await browser.close()
     else:
-        proxy = getproxies().get("https") or getproxies().get("http")
+        proxy = configured_proxy()
         async with httpx.AsyncClient(timeout=timeout, follow_redirects=False, proxy=proxy) as client:
             for _ in range(6):
                 async with client.stream("GET", url, headers={"Accept": "text/html,application/xhtml+xml"}) as response:
@@ -287,13 +334,20 @@ async def _native_fetch(
                         await validate_public_destination(url)
                         continue
                     response.raise_for_status()
-                    if "html" not in response.headers.get("content-type", "").lower():
-                        raise RuntimeError("Native reader supports HTML pages only")
+                    content_type = response.headers.get("content-type", "").lower()
+                    is_pdf = "application/pdf" in content_type or (
+                        urlparse(url).path.lower().endswith(".pdf") and "html" not in content_type
+                    )
+                    if not is_pdf and "html" not in content_type:
+                        raise RuntimeError("Native reader supports HTML and PDF pages only")
+                    max_bytes = MAX_PDF_BYTES if is_pdf else MAX_HTML_BYTES
                     chunks = bytearray()
                     async for chunk in response.aiter_bytes():
                         chunks.extend(chunk)
-                        if len(chunks) > MAX_HTML_BYTES:
-                            raise RuntimeError("HTML page exceeds 5 MB limit")
+                        if len(chunks) > max_bytes:
+                            raise RuntimeError("PDF exceeds 20 MB limit" if is_pdf else "HTML page exceeds 5 MB limit")
+                    if is_pdf:
+                        return await asyncio.to_thread(extract_pdf_text, bytes(chunks))
                     html = chunks.decode(response.encoding or "utf-8", errors="replace")
                     final_url = url
                     break
@@ -323,7 +377,7 @@ async def search_web(
         raise ValueError("engine must be auto or google")
 
     def run_search() -> list[dict[str, str]]:
-        proxy = getproxies().get("https") or getproxies().get("http")
+        proxy = configured_proxy()
         results = DDGS(proxy=proxy, timeout=settings.timeout_seconds).text(
             query, max_results=count, backend=engine,
         )
@@ -358,7 +412,7 @@ async def search_web(
 @mcp.tool()
 async def read_url(
     url: Annotated[str, Field(description="Absolute public http(s) URL to read.")],
-    engine: Annotated[Engine, Field(description="Reader engine: auto, curl, or browser.")] = "auto",
+    engine: Annotated[Engine, Field(description="Reader engine: auto or curl for HTML/PDF; browser for HTML only.")] = "auto",
     max_tokens: Annotated[int, Field(description="Maximum output size in cl100k_base tokens.", ge=500, le=50000)] = settings.max_tokens,
     timeout: Annotated[int, Field(description="Maximum fetch time in seconds.", ge=1, le=180)] = settings.timeout_seconds,
     target_selector: Annotated[str | None, Field(description="Optional CSS selector for the main content.")] = None,
@@ -371,7 +425,7 @@ async def read_url(
 @mcp.tool()
 async def read_urls(
     urls: Annotated[list[str], Field(description="One or two absolute public http(s) URLs to read.", min_length=1, max_length=MAX_BATCH_SIZE)],
-    engine: Annotated[Engine, Field(description="Reader engine: auto, curl, or browser.")] = "auto",
+    engine: Annotated[Engine, Field(description="Reader engine: auto or curl for HTML/PDF; browser for HTML only.")] = "auto",
     max_tokens: Annotated[int, Field(description="Maximum output size per URL in cl100k_base tokens.", ge=500, le=50000)] = settings.max_tokens,
     timeout: Annotated[int, Field(description="Maximum fetch time per URL in seconds.", ge=1, le=180)] = settings.timeout_seconds,
     target_selector: Annotated[str | None, Field(description="Optional CSS selector for the main content on every URL.")] = None,
@@ -393,6 +447,32 @@ async def read_urls(
 
 def main() -> None:
     mcp.run(transport="stdio")
+
+
+def check() -> None:
+    async def run() -> None:
+        print(f"Proxy: {'configured' if configured_proxy() else 'direct'}")
+        await asyncio.to_thread(tiktoken.get_encoding, "cl100k_base")
+        print("Tokenizer: OK")
+        if settings.backend == "native" and not Path(settings.chrome_path).is_file():
+            raise RuntimeError(f"Chrome not found at {settings.chrome_path}; set CHROME_PATH")
+        await read_url("https://example.com", max_tokens=500)
+        print("Static read: OK")
+        await read_url(
+            "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf",
+            max_tokens=500,
+        )
+        print("PDF read: OK")
+        if settings.backend == "native":
+            await read_url("https://example.com", engine="browser", max_tokens=500)
+            print("Browser read: OK")
+        await search_web("example domain", count=1)
+        print("Search: OK")
+
+    try:
+        asyncio.run(run())
+    except Exception as exc:
+        raise SystemExit(f"Check failed: {exc}") from exc
 
 
 if __name__ == "__main__":
