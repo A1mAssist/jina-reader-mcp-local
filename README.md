@@ -34,7 +34,7 @@ Tools:
 
 The native backend uses Windows proxy environment variables (`HTTPS_PROXY`, `HTTP_PROXY`, `ALL_PROXY`) when present, or the Windows system proxy setting. Static extraction is the default; use `engine="browser"` for JavaScript-driven pages. Set `CHROME_PATH` if Chrome is installed outside `C:\Program Files\Google\Chrome\Application\chrome.exe`. Chrome starts for a browser-mode request and closes afterward.
 
-Native mode supports HTML, with a 5 MB page limit. `max_tokens` is an approximate output cap in native mode. It blocks obvious local and private targets, including redirects, but is intended for a local Agent rather than a network-facing service.
+Native mode supports HTML, with a 5 MB page limit. `max_tokens` limits output using the `cl100k_base` tokenizer (other models may count tokens differently). The timeout is a total deadline for each read or search call, including queue time and redirects. URLs and their DNS answers are checked for private addresses on each navigation and redirect. If Windows DNS cannot resolve a host while a proxy is configured, the server queries Cloudflare DNS through that proxy. This is a local Agent tool, not a network-facing SSRF sandbox: DNS can change between the check and the connection, especially through a proxy.
 
 ## Optional Jina Reader backend
 
@@ -45,8 +45,8 @@ Set `READER_BACKEND=reader` and `READER_BASE_URL` to use an existing Jina Reader
 | `READER_BACKEND` | `native` | `native` or `reader` for page reading |
 | `READER_BASE_URL` | `http://127.0.0.1:3000` | Optional Jina Reader HTTP endpoint |
 | `READER_API_KEY` | empty | Optional Bearer token for Reader backend |
-| `READER_TIMEOUT_SECONDS` | `30` | Request timeout, 1-180 seconds |
-| `READER_MAX_TOKENS` | `8000` | Output cap, 500-50000 |
+| `READER_TIMEOUT_SECONDS` | `30` | Total call timeout, 1-180 seconds |
+| `READER_MAX_TOKENS` | `8000` | `cl100k_base` output cap, 500-50000 |
 | `READER_MAX_CONCURRENCY` | `1` | Concurrent requests, 1-4 |
 | `CHROME_PATH` | system Chrome path | Browser-mode executable |
 

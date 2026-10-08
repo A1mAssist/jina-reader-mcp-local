@@ -1,5 +1,7 @@
 import asyncio
 import json
+import socket
+import threading
 import unittest
 from dataclasses import replace
 from unittest.mock import AsyncMock, patch
@@ -14,7 +16,7 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(server.validate_target_url("https://example.com/a"), "https://example.com/a")
 
     def test_rejects_local_targets(self) -> None:
-        for url in ("http://localhost:8080", "http://127.0.0.1:8080", "http://192.168.1.10"):
+        for url in ("http://localhost:8080", "http://127.0.0.1:8080", "http://192.168.1.10", "http://224.0.0.1"):
             with self.subTest(url=url):
                 with self.assertRaises(ValueError):
                     server.validate_target_url(url)
@@ -26,8 +28,62 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(headers["X-Target-Selector"], "main")
         self.assertEqual(headers["X-Retain-Images"], "none")
 
+    def test_token_limit_uses_tokenizer(self) -> None:
+        content = "你好，web reader. " * 100
+        limited = server.limit_tokens(content, 20)
+        encoding = server.tiktoken.get_encoding("cl100k_base")
+        self.assertLessEqual(len(encoding.encode_ordinary(limited)), 20)
+        self.assertTrue(content.startswith(limited))
+
 
 class FetchTests(unittest.IsolatedAsyncioTestCase):
+    async def test_rejects_domain_with_private_dns_answer(self) -> None:
+        answers = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 443)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443)),
+        ]
+        with patch("jina_reader_mcp.server.socket.getaddrinfo", return_value=answers):
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                await server.validate_public_destination("https://example.com")
+
+    async def test_proxy_dns_fallback_rejects_private_answer(self) -> None:
+        def dns_response(request):
+            if request.url.params["type"] == "A":
+                return httpx.Response(200, json={"Status": 0, "Answer": [{"type": 1, "data": "93.184.215.14"}]})
+            return httpx.Response(200, json={"Status": 0, "Answer": [{"type": 28, "data": "::1"}]})
+
+        client_type = httpx.AsyncClient
+        transport = httpx.MockTransport(dns_response)
+        with patch("jina_reader_mcp.server.socket.getaddrinfo", side_effect=socket.gaierror), patch(
+            "jina_reader_mcp.server.getproxies", return_value={"https": "http://127.0.0.1:7890"}
+        ), patch(
+            "jina_reader_mcp.server.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_type(transport=transport, timeout=kwargs["timeout"]),
+        ):
+            with self.assertRaisesRegex(ValueError, "non-public"):
+                await server.validate_public_destination("https://example.com")
+
+    async def test_proxy_dns_failure_is_closed(self) -> None:
+        client_type = httpx.AsyncClient
+        transport = httpx.MockTransport(lambda request: httpx.Response(503))
+        with patch("jina_reader_mcp.server.socket.getaddrinfo", side_effect=socket.gaierror), patch(
+            "jina_reader_mcp.server.getproxies", return_value={"https": "http://127.0.0.1:7890"}
+        ), patch(
+            "jina_reader_mcp.server.httpx.AsyncClient",
+            side_effect=lambda **kwargs: client_type(transport=transport, timeout=kwargs["timeout"]),
+        ):
+            with self.assertRaisesRegex(ValueError, "Public DNS lookup failed"):
+                await server.validate_public_destination("https://example.com")
+
+    async def test_read_has_one_total_deadline(self) -> None:
+        async def slow_fetch(*_args):
+            await asyncio.sleep(2)
+            return "late"
+
+        with patch("jina_reader_mcp.server._fetch_impl", side_effect=slow_fetch):
+            with self.assertRaisesRegex(RuntimeError, "total timeout"):
+                await server._fetch("https://example.com", "auto", 8000, 1, None, None)
+
     async def test_fetches_markdown_from_reader(self) -> None:
         response = httpx.Response(
             200,
@@ -78,18 +134,45 @@ class FetchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ddgs.return_value.text.call_args.kwargs["backend"], "auto")
         self.assertEqual(ddgs.call_args.kwargs["proxy"], "http://127.0.0.1:7890")
 
+    async def test_search_timeout_keeps_slot_until_thread_finishes(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        slot = asyncio.Semaphore(1)
+
+        def slow_search(*_args, **_kwargs):
+            started.set()
+            release.wait(3)
+            return [{"title": "Late", "href": "https://example.com", "body": "Late result"}]
+
+        with patch.object(server, "settings", replace(server.settings, timeout_seconds=1)), patch.object(
+            server, "semaphore", slot
+        ), patch("jina_reader_mcp.server.DDGS") as ddgs:
+            ddgs.return_value.text.side_effect = slow_search
+            try:
+                with self.assertRaisesRegex(RuntimeError, "total timeout"):
+                    await server.search_web("slow", count=1)
+                self.assertTrue(started.is_set())
+                self.assertTrue(slot.locked())
+            finally:
+                release.set()
+            await asyncio.wait_for(slot.acquire(), timeout=2)
+            slot.release()
+
     async def test_native_reader_rejects_redirect_to_localhost(self) -> None:
         def redirect(request):
             return httpx.Response(302, headers={"location": "http://127.0.0.1/private"})
 
         client_type = httpx.AsyncClient
         transport = httpx.MockTransport(redirect)
-        with patch("jina_reader_mcp.server.getproxies", return_value={}), patch(
+        public_answer = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.215.14", 443))]
+        with patch("jina_reader_mcp.server.socket.getaddrinfo", return_value=public_answer), patch(
+            "jina_reader_mcp.server.getproxies", return_value={}
+        ), patch(
             "jina_reader_mcp.server.httpx.AsyncClient",
             side_effect=lambda **kwargs: client_type(transport=transport, **kwargs),
         ):
             with self.assertRaises(ValueError):
-                await server._native_fetch("https://example.com", "auto", 8000, 30, None, None)
+                await server._native_fetch("https://example.com", "auto", 30, None, None)
 
 
 if __name__ == "__main__":

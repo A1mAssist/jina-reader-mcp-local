@@ -4,6 +4,7 @@ import asyncio
 import ipaddress
 import json
 import os
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Annotated, Literal
@@ -11,6 +12,7 @@ from urllib.parse import urlparse
 from urllib.request import getproxies
 
 import httpx
+import tiktoken
 import trafilatura
 from ddgs import DDGS
 from mcp.server.fastmcp import FastMCP
@@ -96,12 +98,69 @@ def validate_target_url(url: str) -> str:
         address = ipaddress.ip_address(hostname)
     except ValueError:
         address = None
-    if address and (address.is_private or address.is_loopback or address.is_link_local or address.is_reserved):
-        raise ValueError("private, loopback, link-local, and reserved IPs are not allowed")
+    if address and (not address.is_global or address.is_multicast):
+        raise ValueError("non-public IPs are not allowed")
 
-    # ponytail: block obvious local targets here and rely on Reader's existing SSRF guard;
-    # add DNS pinning only if this adapter ever becomes a network-facing service.
     return url
+
+
+async def validate_public_destination(url: str) -> str:
+    validate_target_url(url)
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    assert hostname is not None
+    try:
+        answers = await asyncio.to_thread(
+            socket.getaddrinfo, hostname, parsed.port or (443 if parsed.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+        addresses = [entry[4][0] for entry in answers]
+    except OSError as exc:
+        proxy = getproxies().get("https") or getproxies().get("http")
+        if not proxy:
+            raise ValueError(f"Could not resolve hostname: {hostname}") from exc
+        addresses = await _resolve_public_dns(hostname, proxy)
+    if not addresses:
+        raise ValueError("host resolves to a non-public IP address")
+    for value in addresses:
+        address = ipaddress.ip_address(value)
+        if not address.is_global or address.is_multicast:
+            raise ValueError("host resolves to a non-public IP address")
+    return url
+
+
+async def _resolve_public_dns(hostname: str, proxy: str) -> list[str]:
+    try:
+        async with httpx.AsyncClient(proxy=proxy, timeout=5) as client:
+            responses = await asyncio.gather(*(
+                client.get(
+                    "https://cloudflare-dns.com/dns-query",
+                    params={"name": hostname, "type": record_type},
+                    headers={"Accept": "application/dns-json"},
+                )
+                for record_type in ("A", "AAAA")
+            ))
+            addresses = []
+            for response in responses:
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("Status") != 0:
+                    raise ValueError(f"Public DNS could not resolve hostname: {hostname}")
+                addresses.extend(
+                    answer["data"] for answer in payload.get("Answer", [])
+                    if answer.get("type") in (1, 28)
+                )
+            return addresses
+    except (httpx.HTTPError, KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"Public DNS lookup failed for hostname: {hostname}") from exc
+
+
+def limit_tokens(content: str, max_tokens: int) -> str:
+    encoding = tiktoken.get_encoding("cl100k_base")
+    tokens = encoding.encode_ordinary(content)
+    if len(tokens) <= max_tokens:
+        return content
+    return encoding.decode_bytes(tokens[:max_tokens]).decode("utf-8", errors="ignore")
 
 
 def _headers(
@@ -141,39 +200,52 @@ async def _fetch(
     if not 1 <= timeout <= 180:
         raise ValueError("timeout must be between 1 and 180 seconds")
 
+    try:
+        return await asyncio.wait_for(
+            _fetch_impl(url, engine, max_tokens, timeout, target_selector, wait_for_selector),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"Web read exceeded {timeout} second total timeout") from exc
+
+
+async def _fetch_impl(
+    url: str, engine: Engine, max_tokens: int, timeout: int,
+    target_selector: str | None, wait_for_selector: str | None,
+) -> str:
     async with semaphore:
         try:
             if settings.backend == "native":
-                return await _native_fetch(url, engine, max_tokens, timeout, target_selector, wait_for_selector)
-            request_headers = _headers(engine, max_tokens, target_selector, wait_for_selector)
-            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-                response = await client.post(
-                    f"{settings.reader_base_url}/",
-                    headers=request_headers,
-                    json={"url": url, "timeout": timeout},
-                )
-                response.raise_for_status()
+                content = await _native_fetch(url, engine, timeout, target_selector, wait_for_selector)
+            else:
+                request_headers = _headers(engine, max_tokens, target_selector, wait_for_selector)
+                async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                    response = await client.post(
+                        f"{settings.reader_base_url}/",
+                        headers=request_headers,
+                        json={"url": url, "timeout": timeout},
+                    )
+                    response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                if "application/json" in content_type:
+                    payload = response.json()
+                    data = payload.get("data", payload) if isinstance(payload, dict) else payload
+                    content = data["content"] if isinstance(data, dict) and isinstance(data.get("content"), str) else str(payload)
+                else:
+                    content = response.text
         except httpx.HTTPStatusError as exc:
             detail = exc.response.text[:500].replace("\n", " ")
             raise RuntimeError(f"Web server returned HTTP {exc.response.status_code}: {detail}") from exc
         except httpx.HTTPError as exc:
             raise RuntimeError(f"Web request failed: {exc}") from exc
-
-    content_type = response.headers.get("content-type", "")
-    if "application/json" in content_type:
-        payload = response.json()
-        if isinstance(payload, dict):
-            data = payload.get("data", payload)
-            if isinstance(data, dict) and isinstance(data.get("content"), str):
-                return data["content"]
-        return str(payload)
-    return response.text
+        return await asyncio.to_thread(limit_tokens, content, max_tokens)
 
 
 async def _native_fetch(
-    url: str, engine: Engine, max_tokens: int, timeout: int,
+    url: str, engine: Engine, timeout: int,
     target_selector: str | None, wait_for_selector: str | None,
 ) -> str:
+    await validate_public_destination(url)
     if engine == "browser" or target_selector or wait_for_selector:
         chrome = Path(settings.chrome_path)
         if not chrome.is_file():
@@ -187,7 +259,7 @@ async def _native_fetch(
                 page = await browser.new_page()
                 async def allow_public(route):
                     try:
-                        validate_target_url(route.request.url)
+                        await validate_public_destination(route.request.url)
                     except ValueError:
                         await route.abort()
                     else:
@@ -196,7 +268,7 @@ async def _native_fetch(
                 response = await page.goto(url, wait_until="domcontentloaded", timeout=timeout * 1000)
                 if response and response.status >= 400:
                     raise RuntimeError(f"Web server returned HTTP {response.status}")
-                validate_target_url(page.url)
+                await validate_public_destination(page.url)
                 if wait_for_selector:
                     await page.locator(wait_for_selector).wait_for(timeout=timeout * 1000)
                 html = await (page.locator(target_selector).first.inner_html() if target_selector else page.content())
@@ -212,7 +284,7 @@ async def _native_fetch(
                 async with client.stream("GET", url, headers={"Accept": "text/html,application/xhtml+xml"}) as response:
                     if response.is_redirect:
                         url = str(response.next_request.url)
-                        validate_target_url(url)
+                        await validate_public_destination(url)
                         continue
                     response.raise_for_status()
                     if "html" not in response.headers.get("content-type", "").lower():
@@ -233,7 +305,7 @@ async def _native_fetch(
     )
     if not content:
         raise RuntimeError("No readable content found; try engine='browser'")
-    return content[:max_tokens * 4]
+    return content
 
 
 @mcp.tool()
@@ -260,11 +332,24 @@ async def search_web(
             for item in results[:count]
         ]
 
-    async with semaphore:
-        try:
-            results = await asyncio.to_thread(run_search)
-        except Exception as exc:
-            raise RuntimeError(f"{engine} search failed: {exc}") from exc
+    async def perform_search() -> list[dict[str, str]]:
+        await semaphore.acquire()
+        task = asyncio.create_task(asyncio.to_thread(run_search))
+
+        def release_slot(done: asyncio.Task) -> None:
+            semaphore.release()
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(release_slot)
+        return await asyncio.shield(task)
+
+    try:
+        results = await asyncio.wait_for(perform_search(), timeout=settings.timeout_seconds)
+    except asyncio.TimeoutError as exc:
+        raise RuntimeError(f"Search exceeded {settings.timeout_seconds} second total timeout") from exc
+    except Exception as exc:
+        raise RuntimeError(f"{engine} search failed: {exc}") from exc
     if not results:
         raise RuntimeError(f"{engine} returned no results")
     return json.dumps({"results": results}, ensure_ascii=False)
@@ -274,7 +359,7 @@ async def search_web(
 async def read_url(
     url: Annotated[str, Field(description="Absolute public http(s) URL to read.")],
     engine: Annotated[Engine, Field(description="Reader engine: auto, curl, or browser.")] = "auto",
-    max_tokens: Annotated[int, Field(description="Maximum output size in Reader tokens.", ge=500, le=50000)] = settings.max_tokens,
+    max_tokens: Annotated[int, Field(description="Maximum output size in cl100k_base tokens.", ge=500, le=50000)] = settings.max_tokens,
     timeout: Annotated[int, Field(description="Maximum fetch time in seconds.", ge=1, le=180)] = settings.timeout_seconds,
     target_selector: Annotated[str | None, Field(description="Optional CSS selector for the main content.")] = None,
     wait_for_selector: Annotated[str | None, Field(description="Optional CSS selector to wait for before extraction.")] = None,
@@ -287,7 +372,7 @@ async def read_url(
 async def read_urls(
     urls: Annotated[list[str], Field(description="One or two absolute public http(s) URLs to read.", min_length=1, max_length=MAX_BATCH_SIZE)],
     engine: Annotated[Engine, Field(description="Reader engine: auto, curl, or browser.")] = "auto",
-    max_tokens: Annotated[int, Field(description="Maximum output size per URL in Reader tokens.", ge=500, le=50000)] = settings.max_tokens,
+    max_tokens: Annotated[int, Field(description="Maximum output size per URL in cl100k_base tokens.", ge=500, le=50000)] = settings.max_tokens,
     timeout: Annotated[int, Field(description="Maximum fetch time per URL in seconds.", ge=1, le=180)] = settings.timeout_seconds,
     target_selector: Annotated[str | None, Field(description="Optional CSS selector for the main content on every URL.")] = None,
     wait_for_selector: Annotated[str | None, Field(description="Optional CSS selector to wait for on every URL.")] = None,
