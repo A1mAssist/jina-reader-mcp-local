@@ -1,5 +1,7 @@
 # Local Web Reader MCP
 
+[简体中文](README.zh-CN.md) | English
+
 A Windows-native stdio MCP server for searching the web and reading public HTML pages and text PDFs. It runs only when an Agent starts it. No Docker, WSL, or external search API key is needed.
 
 The original self-hosted Jina Reader HTTP adapter is still available with `READER_BACKEND=reader`. The native backend uses [ddgs](https://github.com/deedy5/ddgs) for search and [Trafilatura](https://github.com/adbar/trafilatura) for HTML extraction. Browser mode uses an installed Chrome through Playwright.
@@ -16,18 +18,20 @@ uv run python -m unittest discover -s tests -v
 
 `jina-reader-check` preloads the tokenizer vocabulary, checks Chrome, and tests static HTML reading, PDF reading, browser reading, and search through the current proxy. It needs network access; the vocabulary may be downloaded on its first run.
 
-Configure your Agent to launch this checkout as a stdio MCP server:
+Configure your Agent to launch this checkout as a stdio MCP server. Replace the example path with the absolute path to your checkout:
 
 ```json
 {
   "mcpServers": {
-    "local-web-reader": {
+    "local_web_reader": {
       "command": "uv",
-      "args": ["run", "--directory", "D:/Workspaces/PROJECTLESS_CODEX_TASKS/2026-10-08/jina", "jina-reader-mcp"]
+      "args": ["run", "--directory", "D:/path/to/jina-reader-mcp-local", "jina-reader-mcp"]
     }
   }
 }
 ```
+
+If your Agent cannot find `uv`, set `command` to the absolute path of `uv.exe` and restart the client.
 
 Tools:
 
